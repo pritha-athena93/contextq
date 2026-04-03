@@ -117,7 +117,7 @@ This creates:
 - GCP Service Account `ray-sa` with `storage.objectAdmin` and `aiplatform.user` roles
 - Workload Identity binding: `ray-ksa` (K8s SA) -> `ray-sa` (GCP SA)
 
-### 5. Build and push docker images.
+### 5. Build and push docker images
 
 Can be done via the deploy github action too. Or follow the instructions below -
 ```bash
