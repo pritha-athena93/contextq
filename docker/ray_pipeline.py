@@ -38,36 +38,20 @@ def ingest_data(source_name: str, source_path: str = "", n: int = 1000) -> pd.Da
 class EntityResolver:
     def __init__(self):
         self._model = None
-        if not GCP_PROJECT:
-            print("WARNING: GOOGLE_CLOUD_PROJECT not set — falling back to hash-based resolution.")
-            return
+        import vertexai
+        from vertexai.generative_models import GenerativeModel
 
-        try:
-            import vertexai
-            from vertexai.generative_models import GenerativeModel
-
-            vertexai.init(project=GCP_PROJECT, location=VERTEX_REGION)
-            self._model = GenerativeModel("gemini-2.5-flash")
-        except Exception as e:
-            print(f"WARNING: Vertex AI initialisation failed ({e}) — falling back to hash-based resolution.")
+        vertexai.init(project=GCP_PROJECT, location=VERTEX_REGION)
+        self._model = GenerativeModel("gemini-2.5-flash")
 
     def _llm_canonical_name(self, name: str) -> str:
         """Normalise a company name via Gemini, or hash-based fallback."""
-        if self._model is None:
-            import re
-            canonical = re.sub(r"\b(Inc|LLC|Ltd|Corp|Co|Group|Holdings)\.?$", "", name, flags=re.I).strip()
-            return canonical.title()
-
-        try:
-            prompt = (
-                f"Return only the canonical legal name of this company, "
-                f"no explanation: '{name}'"
-            )
-            response = self._model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            print(f"WARNING: Gemini call failed for '{name}' ({e}) — using hash fallback.")
-            return name
+        prompt = (
+            f"Return only the canonical legal name of this company, "
+            f"no explanation: '{name}'"
+        )
+        response = self._model.generate_content(prompt)
+        return response.text.strip()
 
     def resolve_batch(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
