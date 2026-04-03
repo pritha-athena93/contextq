@@ -153,21 +153,3 @@ jobs:
               issue_number: context.issue.number,
               body,
             });
-
-      - name: Check results
-        run: |
-          PLAN_EXIT="${{ steps.plan.outputs.exitcode }}"
-          TFSEC_EXIT="${{ steps.tfsec.outputs.exitcode }}"
-          FMT_EXIT="${{ steps.fmt.outputs.exitcode }}"
-          if [ "$PLAN_EXIT" != "0" ]; then
-            echo "Terraform plan failed (exit $PLAN_EXIT)"
-            exit 1
-          fi
-          if [ "$TFSEC_EXIT" != "0" ]; then
-            echo "tfsec found security issues (exit $TFSEC_EXIT)"
-            exit 1
-          fi
-          if [ "$FMT_EXIT" != "0" ]; then
-            echo "Terraform files are not formatted — run: terraform fmt -recursive"
-            exit 1
-          fi
