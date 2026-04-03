@@ -14,10 +14,6 @@ on:
         description: GAR repository name
         default: ray-platform
         required: false
-      helm_version:
-        description: Helm CLI version
-        default: v3.14.4
-        required: false
 
 permissions:
   contents: read
@@ -50,45 +46,3 @@ jobs:
           IMAGE="asia-south1-docker.pkg.dev/gen-ai-pritha/ray-platform/ray-pipeline:${{ github.sha }}"
           docker build -t "$IMAGE" ./docker
           docker push "$IMAGE"
-
-  deploy-rayjob:
-    name: Deploy RayCluster + RayJob
-    runs-on: ubuntu-latest
-    needs: build-and-push
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/825707201403/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-sa@gen-ai-pritha.iam.gserviceaccount.com
-
-      - name: Get GKE credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: ray-platform
-          location: asia-south1
-          project_id: gen-ai-pritha
-
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: ${{ env.HELM_VERSION }}
-
-      - name: Deploy RayCluster and RayJob via Helm
-        run: |
-          helm upgrade --install ray-cluster k8s/ray-cluster \
-            --namespace ray \
-            --create-namespace \
-            --set image.tag=${{ github.sha }} \
-            --set global.projectId=gen-ai-pritha \
-            --set global.garRegion=asia-south1 \
-            --set global.garRepo=ray-platform \
-            --set global.vertexRegion=asia-south1 \
-            --set icebergWarehouseBucket=gen-ai-pritha-ray-iceberg-warehouse \
-            --set job.enabled=true \
-            --atomic \
-            --timeout 5m
