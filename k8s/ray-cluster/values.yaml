@@ -1,0 +1,71 @@
+global:
+  projectId: "gen-ai-pritha"   # override at deploy time: --set global.projectId=<your-project>
+  garRegion: asia-south1
+  garRepo: ray-platform
+  vertexRegion: asia-south1
+
+image:
+  tag: "2.10.0"
+  gpuTag: "2.10.0-gpu"
+
+nessie:
+  uri: https://nessie.nessie-ns:19120/iceberg
+  caSecret: nessie-root-ca
+
+icebergWarehouseBucket: "gen-ai-pritha-ray-iceberg-warehouse"
+
+head:
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 3Gi
+    limits:
+      cpu: "2"
+      memory: 6Gi
+  objectStoreMemory: "2000000000"
+  spillVolumeSizeLimit: 10Gi
+
+worker:
+  minReplicas: 0
+  maxReplicas: 10
+  initialReplicas: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+  objectStoreMemory: "2000000000"
+  spillVolumeSizeLimit: 20Gi
+  autoscalerOptions:
+    idleTimeoutSeconds: 60
+    upscalingMode: Default
+
+trainWorker:
+  minReplicas: 0
+  maxReplicas: 4
+  initialReplicas: 0
+  resources:
+    requests:
+      cpu: "6"
+      memory: 24Gi
+    limits:
+      cpu: "8"
+      memory: 30Gi
+      nvidia.com/gpu: "1"
+  objectStoreMemory: "4000000000"
+  spillVolumeSizeLimit: 20Gi
+
+job:
+  enabled: true
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 3
+
+trainJob:
+  enabled: false   # set to true to trigger a training job
+  modelOutputPath: "gs://gen-ai-pritha-ray-iceberg-warehouse/models/entity-matcher"
+  numWorkers: 2
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 3600

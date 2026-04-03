@@ -1,0 +1,95 @@
+name: Build, Push, Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      gar_region:
+        description: GAR and GKE region
+        default: asia-south1
+        required: false
+      gar_repo:
+        description: GAR repository name
+        default: ray-platform
+        required: false
+      helm_version:
+        description: Helm CLI version
+        default: v3.14.4
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GAR_REGION:   ${{ inputs.gar_region   || 'asia-south1' }}
+  GAR_REPO:     ${{ inputs.gar_repo     || 'ray-platform' }}
+  HELM_VERSION: ${{ inputs.helm_version || 'v3.14.4' }}
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for GAR
+        run: gcloud auth configure-docker ${{ env.GAR_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ env.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPO }}/ray-pipeline:${{ github.sha }}"
+          docker build -t "$IMAGE" ./docker
+          docker push "$IMAGE"
+
+  deploy-rayjob:
+    name: Deploy RayCluster + RayJob
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ray-platform
+          location: ${{ env.GAR_REGION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Deploy RayCluster and RayJob via Helm
+        run: |
+          helm upgrade --install ray-cluster k8s/ray-cluster \
+            --namespace ray \
+            --create-namespace \
+            --set image.tag=${{ github.sha }} \
+            --set global.projectId=${{ secrets.GCP_PROJECT_ID }} \
+            --set global.garRegion=${{ env.GAR_REGION }} \
+            --set global.garRepo=${{ env.GAR_REPO }} \
+            --set global.vertexRegion=${{ env.GAR_REGION }} \
+            --set icebergWarehouseBucket=${{ secrets.GCP_PROJECT_ID }}-ray-iceberg-warehouse \
+            --set job.enabled=true \
+            --atomic \
+            --timeout 5m

@@ -1,0 +1,7 @@
+pyiceberg[gcs]==0.7.1
+gcsfs==2024.2.0
+faker==24.0.0
+pandas==2.2.1
+pyarrow==15.0.2
+google-cloud-aiplatform==1.49.0
+sentence-transformers==3.0.1

@@ -1,0 +1,56 @@
+versionStoreType: JDBC
+
+jdbc:
+  jdbcUrl: jdbc:postgresql://postgres-svc.nessie-ns:5432/nessie
+  secret:
+    name: nessie-postgres-creds
+    username: username
+    password: password
+
+service:
+  type: ClusterIP
+  port: 19120
+
+extraVolumes:
+  - name: tls-certs
+    secret:
+      secretName: nessie-tls-secret
+
+extraVolumeMounts:
+  - name: tls-certs
+    mountPath: /certs
+    readOnly: true
+
+extraEnv:
+  - name: QUARKUS_HTTP_SSL_CERTIFICATE_FILES
+    value: /certs/tls.crt
+  - name: QUARKUS_HTTP_SSL_CERTIFICATE_KEY_FILES
+    value: /certs/tls.key
+  - name: QUARKUS_HTTP_INSECURE_REQUESTS
+    value: disabled
+  - name: QUARKUS_HTTP_SSL_PORT
+    value: "19120"
+  - name: NESSIE_CATALOG_DEFAULT_WAREHOUSE
+    value: "warehouse"
+  - name: NESSIE_CATALOG_WAREHOUSES__WAREHOUSE__LOCATION
+    value: "gs://gen-ai-pritha-ray-iceberg-warehouse/warehouse"
+  - name: NESSIE_CATALOG_SERVICE_GCS_DEFAULT_OPTIONS_AUTH_TYPE
+    value: APPLICATION_DEFAULT
+  - name: NESSIE_CATALOG_SERVICE_GCS_DEFAULT_OPTIONS_PROJECT_ID
+    value: gen-ai-pritha
+
+livenessProbe:
+  initialDelaySeconds: 60
+readinessProbe:
+  initialDelaySeconds: 60
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+podLabels:
+  app.kubernetes.io/name: nessie

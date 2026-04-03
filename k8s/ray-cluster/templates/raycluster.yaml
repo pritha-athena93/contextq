@@ -1,0 +1,176 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-cluster
+  namespace: ray
+  labels:
+    ray.io/cluster: ray-cluster
+spec:
+  rayVersion: {{ .Chart.AppVersion | quote }}
+
+  autoscalerOptions:
+    idleTimeoutSeconds: {{ .Values.worker.autoscalerOptions.idleTimeoutSeconds }}
+    upscalingMode: {{ .Values.worker.autoscalerOptions.upscalingMode }}
+
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      object-store-memory: {{ .Values.head.objectStoreMemory | quote }}
+    serviceType: ClusterIP
+    template:
+      spec:
+        serviceAccountName: ray-ksa
+        nodeSelector:
+          cloud.google.com/gke-nodepool: head-pool
+        volumes:
+          - name: ray-spill
+            emptyDir:
+              sizeLimit: {{ .Values.head.spillVolumeSizeLimit }}
+          - name: nessie-ca-cert
+            secret:
+              secretName: {{ .Values.nessie.caSecret }}
+        containers:
+          - name: ray-head
+            image: {{ include "ray-cluster.image" . }}
+            imagePullPolicy: Always
+            resources: {{ toYaml .Values.head.resources | nindent 14 }}
+            ports:
+              - containerPort: 6379
+                name: gcs
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+            env:
+              - name: RAY_OBJECT_STORE_MEMORY
+                value: {{ .Values.head.objectStoreMemory | quote }}
+              - name: RAY_object_spilling_config
+                value: '{"type":"filesystem","params":{"directory_path":"/ray-spill"}}'
+              - name: REQUESTS_CA_BUNDLE
+                value: /etc/ssl/nessie/ca.crt
+              - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+                value: python
+            volumeMounts:
+              - name: ray-spill
+                mountPath: /ray-spill
+              - name: nessie-ca-cert
+                mountPath: /etc/ssl/nessie/ca.crt
+                subPath: ca.crt
+                readOnly: true
+
+  workerGroupSpecs:
+    - groupName: default-worker
+      replicas: {{ .Values.worker.initialReplicas }}
+      minReplicas: {{ .Values.worker.minReplicas }}
+      maxReplicas: {{ .Values.worker.maxReplicas }}
+      rayStartParams:
+        object-store-memory: {{ .Values.worker.objectStoreMemory | quote }}
+        resources: '"{\"worker_pool\":1}"'
+      template:
+        spec:
+          serviceAccountName: ray-ksa
+          nodeSelector:
+            cloud.google.com/gke-nodepool: worker-pool
+          tolerations:
+            - key: cloud.google.com/gke-spot
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          volumes:
+            - name: ray-spill
+              emptyDir:
+                sizeLimit: {{ .Values.worker.spillVolumeSizeLimit }}
+            - name: nessie-ca-cert
+              secret:
+                secretName: {{ .Values.nessie.caSecret }}
+          containers:
+            - name: ray-worker
+              image: {{ include "ray-cluster.image" . }}
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: {{ .Values.worker.resources.requests.cpu | quote }}
+                  memory: {{ .Values.worker.resources.requests.memory }}
+                limits:
+                  cpu: {{ .Values.worker.resources.limits.cpu | quote }}
+                  memory: {{ .Values.worker.resources.limits.memory }}
+              env:
+                - name: RAY_OBJECT_STORE_MEMORY
+                  value: {{ .Values.worker.objectStoreMemory | quote }}
+                - name: RAY_object_spilling_config
+                  value: '{"type":"filesystem","params":{"directory_path":"/ray-spill"}}'
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: {{ .Values.global.projectId | quote }}
+                - name: VERTEX_REGION
+                  value: {{ .Values.global.vertexRegion | quote }}
+                - name: REQUESTS_CA_BUNDLE
+                  value: /etc/ssl/nessie/ca.crt
+                - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+                  value: python
+              volumeMounts:
+                - name: ray-spill
+                  mountPath: /ray-spill
+                - name: nessie-ca-cert
+                  mountPath: /etc/ssl/nessie/ca.crt
+                  subPath: ca.crt
+                  readOnly: true
+
+    - groupName: train-worker
+      replicas: {{ .Values.trainWorker.initialReplicas }}
+      minReplicas: {{ .Values.trainWorker.minReplicas }}
+      maxReplicas: {{ .Values.trainWorker.maxReplicas }}
+      rayStartParams:
+        object-store-memory: {{ .Values.trainWorker.objectStoreMemory | quote }}
+        resources: '"{\"train_worker\":1}"'
+        num-gpus: "1"
+      template:
+        spec:
+          serviceAccountName: ray-ksa
+          nodeSelector:
+            cloud.google.com/gke-nodepool: train-pool
+          tolerations:
+            - key: ray-train
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "present"
+              effect: NoSchedule
+          volumes:
+            - name: ray-spill
+              emptyDir:
+                sizeLimit: {{ .Values.trainWorker.spillVolumeSizeLimit }}
+            - name: nessie-ca-cert
+              secret:
+                secretName: {{ .Values.nessie.caSecret }}
+          containers:
+            - name: ray-train-worker
+              image: {{ include "ray-cluster.imageGPU" . }}
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: {{ .Values.trainWorker.resources.requests.cpu | quote }}
+                  memory: {{ .Values.trainWorker.resources.requests.memory }}
+                limits:
+                  cpu: {{ .Values.trainWorker.resources.limits.cpu | quote }}
+                  memory: {{ .Values.trainWorker.resources.limits.memory }}
+                  nvidia.com/gpu: {{ index .Values.trainWorker.resources.limits "nvidia.com/gpu" | quote }}
+              env:
+                - name: RAY_OBJECT_STORE_MEMORY
+                  value: {{ .Values.trainWorker.objectStoreMemory | quote }}
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: {{ .Values.global.projectId | quote }}
+                - name: VERTEX_REGION
+                  value: {{ .Values.global.vertexRegion | quote }}
+                - name: REQUESTS_CA_BUNDLE
+                  value: /etc/ssl/nessie/ca.crt
+                - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+                  value: python
+              volumeMounts:
+                - name: ray-spill
+                  mountPath: /ray-spill
+                - name: nessie-ca-cert
+                  mountPath: /etc/ssl/nessie/ca.crt
+                  subPath: ca.crt
+                  readOnly: true

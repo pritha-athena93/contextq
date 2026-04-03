@@ -1,0 +1,4 @@
+installCRDs: true
+
+extraArgs:
+  - --enable-certificate-owner-ref=true

@@ -1,0 +1,171 @@
+name: Terraform Plan + Security Scan
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/pr.yaml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.7.5"
+  TFSEC_VERSION: "v1.28.6"
+  WORKING_DIR: terraform
+
+jobs:
+  terraform-plan-and-scan:
+    name: Plan + tfsec
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          cat <<EOF > backend-ci.hcl
+          bucket = "${{ secrets.TF_STATE_BUCKET }}"
+          prefix = "ray-platform/state"
+          EOF
+          terraform init -input=false -backend-config=backend-ci.hcl
+
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform fmt -check -recursive -no-color
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform plan -input=false -no-color \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="llm_api_key=REDACTED" \
+            2>&1 | tee /tmp/tfplan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+        
+      - name: Install tfsec
+        run: |
+          curl -sLo tfsec https://github.com/aquasecurity/tfsec/releases/download/${{ env.TFSEC_VERSION }}/tfsec-linux-amd64
+          chmod +x tfsec
+          sudo mv tfsec /usr/local/bin/tfsec
+
+      - name: Run tfsec
+        id: tfsec
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          tfsec . --no-color --format=default 2>&1 | tee /tmp/tfsec.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true 
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
+          TFSEC_EXIT: ${{ steps.tfsec.outputs.exitcode }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            const planOutput  = fs.readFileSync('/tmp/tfplan.txt',  'utf8');
+            const tfsecOutput = fs.readFileSync('/tmp/tfsec.txt',   'utf8');
+            const planExit    = '${{ steps.plan.outputs.exitcode }}';
+            const tfsecExit   = '${{ steps.tfsec.outputs.exitcode }}';
+            const fmtExit     = '${{ steps.fmt.outputs.exitcode }}';
+
+            const planStatus  = planExit  === '0' ? 'PASSED' : 'FAILED';
+            const tfsecStatus = tfsecExit === '0' ? 'PASSED' : 'FINDINGS';
+            const fmtStatus   = fmtExit   === '0' ? 'PASSED' : 'NEEDS FORMATTING (run terraform fmt -recursive)';
+
+            const body = [
+              `## Terraform Format: ${fmtStatus}`,
+              '',
+              `## Terraform Plan: ${planStatus}`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```hcl',
+              planOutput.slice(0, 60000),   // GitHub comment limit guard
+              '```',
+              '</details>',
+              '',
+              `## tfsec Security Scan: ${tfsecStatus}`,
+              '',
+              '<details><summary>Show tfsec findings</summary>',
+              '',
+              '```',
+              tfsecOutput.slice(0, 20000),
+              '```',
+              '</details>',
+              '',
+              `*Workflow: \`${{ github.workflow }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`,
+            ].join('\n');
+
+            // Delete previous bot comment on this PR (keep thread clean)
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const comment of comments) {
+              if (comment.user.type === 'Bot' && comment.body.includes('Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Check results
+        run: |
+          PLAN_EXIT="${{ steps.plan.outputs.exitcode }}"
+          TFSEC_EXIT="${{ steps.tfsec.outputs.exitcode }}"
+          FMT_EXIT="${{ steps.fmt.outputs.exitcode }}"
+          if [ "$PLAN_EXIT" != "0" ]; then
+            echo "Terraform plan failed (exit $PLAN_EXIT)"
+            exit 1
+          fi
+          if [ "$TFSEC_EXIT" != "0" ]; then
+            echo "tfsec found security issues (exit $TFSEC_EXIT)"
+            exit 1
+          fi
+          if [ "$FMT_EXIT" != "0" ]; then
+            echo "Terraform files are not formatted — run: terraform fmt -recursive"
+            exit 1
+          fi

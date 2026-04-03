@@ -1,0 +1,86 @@
+{{- if .Values.job.enabled }}
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: ray-pipeline-job
+  namespace: ray
+spec:
+  clusterSelector:
+    ray.io/cluster: ray-cluster
+
+  entrypoint: python /app/ray_pipeline.py --mode pipeline
+  shutdownAfterJobFinishes: true
+
+  activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+
+  runtimeEnvYAML: |
+    env_vars:
+      ICEBERG_WAREHOUSE: {{ include "ray-cluster.icebergWarehouse" . }}
+      NESSIE_URI: {{ .Values.nessie.uri }}
+      RAY_ADDRESS: http://ray-cluster-head-svc:8265
+
+  submitterPodTemplate:
+    metadata:
+      labels:
+        ray.io/component: job-submitter
+    spec:
+      serviceAccountName: ray-ksa
+      restartPolicy: Never
+      containers:
+        - name: ray-job-submitter
+          image: {{ include "ray-cluster.image" . }}
+          imagePullPolicy: Always
+          env:
+            - name: RAY_ADDRESS
+              value: http://ray-cluster-head-svc:8265
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+{{- end }}
+{{- if .Values.trainJob.enabled }}
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: ray-train-job
+  namespace: ray
+spec:
+  clusterSelector:
+    ray.io/cluster: ray-cluster
+
+  entrypoint: python /app/ray_pipeline.py --mode train
+  shutdownAfterJobFinishes: true
+
+  activeDeadlineSeconds: {{ .Values.trainJob.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.trainJob.ttlSecondsAfterFinished }}
+
+  runtimeEnvYAML: |
+    env_vars:
+      ICEBERG_WAREHOUSE: {{ include "ray-cluster.icebergWarehouse" . }}
+      NESSIE_URI: {{ .Values.nessie.uri }}
+      MODEL_OUTPUT_PATH: {{ .Values.trainJob.modelOutputPath }}
+      NUM_WORKERS: {{ .Values.trainJob.numWorkers | quote }}
+      RAY_ADDRESS: http://ray-cluster-head-svc:8265
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+
+  submitterPodTemplate:
+    metadata:
+      labels:
+        ray.io/component: job-submitter
+    spec:
+      serviceAccountName: ray-ksa
+      restartPolicy: Never
+      containers:
+        - name: ray-train-job-submitter
+          image: {{ include "ray-cluster.image" . }}
+          imagePullPolicy: Always
+          env:
+            - name: RAY_ADDRESS
+              value: http://ray-cluster-head-svc:8265
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+{{- end }}
