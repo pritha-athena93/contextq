@@ -68,7 +68,7 @@ jobs:
         id: plan
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          terraform plan -input=false -no-color \
+          terraform plan -lock=false -input=false \
             2>&1 | tee /tmp/tfplan.txt
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
         continue-on-error: true
