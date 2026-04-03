@@ -86,6 +86,15 @@ gcloud projects add-iam-policy-binding gen-ai-pritha \
 gcloud projects add-iam-policy-binding gen-ai-pritha \
   --member="serviceAccount:github-sa@gen-ai-pritha.iam.gserviceaccount.com" \
   --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding gen-ai-pritha \
+  --member="serviceAccount:github-sa@gen-ai-pritha.iam.gserviceaccount.com" \
+  --role="roles/iap.admin"
+
+gcloud iam service-accounts add-iam-policy-binding \
+  ray-sa@gen-ai-pritha.iam.gserviceaccount.com \
+  --member="serviceAccount:github-sa@gen-ai-pritha.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser"
 ```
 
 ### 3. Configure Terraform variables
