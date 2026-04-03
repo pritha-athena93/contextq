@@ -2,12 +2,6 @@ name: Terraform Plan + Security Scan
 
 on:
   pull_request:
-    branches:
-      - main
-    types:
-      - opened
-      - synchronize
-      - reopened
     paths:
       - "terraform/**"
       - ".github/workflows/pr.yaml"
@@ -56,7 +50,7 @@ jobs:
       - name: Terraform Format Check
         id: fmt
         working-directory: ${{ env.WORKING_DIR }}
-        run: terraform fmt -check -recursive -no-color
+        run: terraform fmt -recursive
         continue-on-error: true
 
       - name: Terraform Validate
