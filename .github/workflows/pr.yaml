@@ -30,8 +30,8 @@ jobs:
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          workload_identity_provider: projects/825707201403/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-sa@gen-ai-pritha.iam.gserviceaccount.com
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -44,7 +44,7 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: |
           cat <<EOF > backend-ci.hcl
-          bucket = "${{ secrets.TF_STATE_BUCKET }}"
+          bucket = "gen-ai-pritha-tf-state"
           prefix = "ray-platform/state"
           EOF
           terraform init -input=false -backend-config=backend-ci.hcl
@@ -65,8 +65,6 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: |
           terraform plan -input=false -no-color \
-            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
-            -var="llm_api_key=REDACTED" \
             2>&1 | tee /tmp/tfplan.txt
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
         continue-on-error: true

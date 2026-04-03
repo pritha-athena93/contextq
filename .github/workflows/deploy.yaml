@@ -24,7 +24,6 @@ permissions:
   id-token: write
 
 env:
-  GAR_REGION:   ${{ inputs.gar_region   || 'asia-south1' }}
   GAR_REPO:     ${{ inputs.gar_repo     || 'ray-platform' }}
   HELM_VERSION: ${{ inputs.helm_version || 'v3.14.4' }}
 
@@ -40,15 +39,15 @@ jobs:
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          workload_identity_provider: projects/825707201403/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-sa@gen-ai-pritha.iam.gserviceaccount.com
 
       - name: Configure Docker for GAR
-        run: gcloud auth configure-docker ${{ env.GAR_REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
 
       - name: Build and push
         run: |
-          IMAGE="${{ env.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPO }}/ray-pipeline:${{ github.sha }}"
+          IMAGE="asia-south1-docker.pkg.dev/gen-ai-pritha/ray-platform/ray-pipeline:${{ github.sha }}"
           docker build -t "$IMAGE" ./docker
           docker push "$IMAGE"
 
@@ -64,15 +63,15 @@ jobs:
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          workload_identity_provider: projects/825707201403/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-sa@gen-ai-pritha.iam.gserviceaccount.com
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
           cluster_name: ray-platform
-          location: ${{ env.GAR_REGION }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          location: asia-south1
+          project_id: gen-ai-pritha
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -85,11 +84,11 @@ jobs:
             --namespace ray \
             --create-namespace \
             --set image.tag=${{ github.sha }} \
-            --set global.projectId=${{ secrets.GCP_PROJECT_ID }} \
-            --set global.garRegion=${{ env.GAR_REGION }} \
-            --set global.garRepo=${{ env.GAR_REPO }} \
-            --set global.vertexRegion=${{ env.GAR_REGION }} \
-            --set icebergWarehouseBucket=${{ secrets.GCP_PROJECT_ID }}-ray-iceberg-warehouse \
+            --set global.projectId=gen-ai-pritha \
+            --set global.garRegion=asia-south1 \
+            --set global.garRepo=ray-platform \
+            --set global.vertexRegion=asia-south1 \
+            --set icebergWarehouseBucket=gen-ai-pritha-ray-iceberg-warehouse \
             --set job.enabled=true \
             --atomic \
             --timeout 5m
