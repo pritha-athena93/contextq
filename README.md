@@ -19,7 +19,7 @@ gcloud services enable \
   --project=<PROJECT_ID>
 ```
 
-### 2. GCP resources to exist before Terraform apply.
+### 2. GCP resources to create before Terraform apply.
 
 **Terraform state bucket:**
 ```bash
