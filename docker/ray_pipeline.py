@@ -21,11 +21,13 @@ SOURCE_B_PATH = os.environ.get("SOURCE_B_PATH", "")
 
 
 @ray.remote(resources={"worker_pool": 1})
-def ingest_data(source_name: str, source_path: str = "", n: int = 1000) -> pd.DataFrame:
+def ingest_data(source_name: str, source_path: str, n: int = 1000) -> pd.DataFrame:
     if source_path:
         import ray.data as rd
         ds = rd.read_parquet(source_path)
-        return ds.to_pandas()
+        df = ds.to_pandas()
+        df["source"] = source_name
+        return df
 
     return pd.DataFrame({
         "corporate_name": [fake.company() for _ in range(n)],
@@ -34,29 +36,87 @@ def ingest_data(source_name: str, source_path: str = "", n: int = 1000) -> pd.Da
     })
 
 
+_GEMINI_BATCH_SIZE  = 50
+_GEMINI_MAX_RETRIES = 5
+_GEMINI_BASE_BACKOFF = 1.0  # seconds; doubles each retry for 429s
+
+
 @ray.remote(resources={"worker_pool": 1})
 class EntityResolver:
     def __init__(self):
-        self._model = None
         import vertexai
         from vertexai.generative_models import GenerativeModel
 
         vertexai.init(project=GCP_PROJECT, location=VERTEX_REGION)
         self._model = GenerativeModel("gemini-2.5-flash")
 
-    def _llm_canonical_name(self, name: str) -> str:
-        """Normalise a company name via Gemini, or hash-based fallback."""
+    def _call_with_retry(self, prompt: str) -> str:
+        """Call Gemini with retry on 429 and transient errors. Raises on exhaustion."""
+        import time
+        from google.api_core import exceptions as gex
+
+        for attempt in range(_GEMINI_MAX_RETRIES):
+            try:
+                return self._model.generate_content(prompt).text.strip()
+
+            except gex.ResourceExhausted:
+                # 429 — exponential backoff
+                if attempt == _GEMINI_MAX_RETRIES - 1:
+                    raise
+                wait = _GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[Gemini] 429 rate-limited (attempt {attempt + 1}/{_GEMINI_MAX_RETRIES}), "
+                      f"retrying in {wait:.0f}s …")
+                time.sleep(wait)
+
+            except (gex.ServiceUnavailable, gex.InternalServerError):
+                # 503/500 transient — fixed 2 s, max 3 attempts
+                if attempt >= 2:
+                    raise
+                print(f"[Gemini] transient error (attempt {attempt + 1}), retrying in 2s …")
+                time.sleep(2.0)
+
+            # All other exceptions (auth, invalid arg, etc.) propagate immediately
+
+    def _resolve_chunk(self, names: list[str]) -> list[str]:
+        """Resolve one batch of names in a single Gemini call."""
+        numbered = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(names))
         prompt = (
-            f"Return only the canonical legal name of this company, "
-            f"no explanation: '{name}'"
+            "Return only the canonical legal names of these companies, "
+            "one per line in the same order, prefixed with the same number. "
+            "No explanations:\n" + numbered
         )
-        response = self._model.generate_content(prompt)
-        return response.text.strip()
+        text = self._call_with_retry(prompt)
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        result = []
+        for line in lines:
+            if ". " in line:
+                line = line.split(". ", 1)[1]
+            elif ") " in line:
+                line = line.split(") ", 1)[1]
+            result.append(line.strip())
+
+        if len(result) != len(names):
+            raise ValueError(
+                f"Gemini returned {len(result)} names for {len(names)} inputs. "
+                f"Raw response: {text[:300]}"
+            )
+        return result
 
     def resolve_batch(self, df: pd.DataFrame) -> pd.DataFrame:
+        import hashlib, time
+
         df = df.copy()
-        df["canonical_name"] = df["corporate_name"].apply(self._llm_canonical_name)
-        import hashlib
+        names = df["corporate_name"].tolist()
+        canonical_names: list[str] = []
+
+        for i in range(0, len(names), _GEMINI_BATCH_SIZE):
+            chunk = names[i : i + _GEMINI_BATCH_SIZE]
+            canonical_names.extend(self._resolve_chunk(chunk))
+            # brief pause between batches to stay within RPM quota
+            if i + _GEMINI_BATCH_SIZE < len(names):
+                time.sleep(1.0)
+
+        df["canonical_name"] = canonical_names
         df["canonical_id"]   = df["canonical_name"].str.lower().apply(
             lambda name: hashlib.sha256(name.encode()).hexdigest()[:16]
         )
@@ -213,9 +273,18 @@ def run_training() -> None:
 
 
 
-def run_pipeline() -> None:
-    ds1_ref = ingest_data.remote("dataset_a", SOURCE_A_PATH)
-    ds2_ref = ingest_data.remote("dataset_b", SOURCE_B_PATH)
+def run_pipeline(env: str) -> None:
+    if env == "prod":
+        if not SOURCE_A_PATH or not SOURCE_B_PATH:
+            raise ValueError(
+                "SOURCE_A_PATH and SOURCE_B_PATH must be set in prod mode."
+            )
+        a_path, b_path = SOURCE_A_PATH, SOURCE_B_PATH
+    else:
+        a_path, b_path = "", ""
+
+    ds1_ref = ingest_data.remote("dataset_a", a_path)
+    ds2_ref = ingest_data.remote("dataset_b", b_path)
     df1, df2 = ray.get([ds1_ref, ds2_ref])
     combined = pd.concat([df1, df2], ignore_index=True)
     print(f"Ingested {len(combined)} records from 2 sources.")
@@ -237,14 +306,17 @@ if __name__ == "__main__":
         "--mode",
         choices=["pipeline", "train"],
         default="pipeline",
-        help="pipeline: ingest + resolve + write to Iceberg (worker-pool). "
-             "train: fine-tune entity matcher on GPU (train-pool).",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["dev", "prod"],
+        default="dev",
     )
     args = parser.parse_args()
 
     ray.init()
 
     if args.mode == "pipeline":
-        run_pipeline()
+        run_pipeline(args.env)
     else:
         run_training()

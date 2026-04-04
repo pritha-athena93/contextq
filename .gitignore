@@ -6,4 +6,3 @@ terraform/tfplan
 __pycache__/
 *.pyc
 .venv/
-.md

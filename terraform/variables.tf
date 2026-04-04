@@ -39,3 +39,9 @@ variable "bastion_members" {
   type        = list(string)
   default     = ["user:prithat398@gmail.com"]
 }
+
+variable "switch" {
+  description = "Switch - blue/green"
+  type        = string
+  default     = ""
+}

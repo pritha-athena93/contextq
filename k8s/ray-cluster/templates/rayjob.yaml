@@ -8,7 +8,7 @@ spec:
   clusterSelector:
     ray.io/cluster: ray-cluster
 
-  entrypoint: python /app/ray_pipeline.py --mode pipeline
+  entrypoint: python /app/ray_pipeline.py --mode pipeline --env {{ .Values.job.env }}
   shutdownAfterJobFinishes: true
 
   activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
@@ -19,6 +19,10 @@ spec:
       ICEBERG_WAREHOUSE: {{ include "ray-cluster.icebergWarehouse" . }}
       NESSIE_URI: {{ .Values.nessie.uri }}
       RAY_ADDRESS: http://ray-cluster-head-svc:8265
+      GOOGLE_CLOUD_PROJECT: {{ .Values.global.projectId }}
+      VERTEX_REGION: {{ .Values.global.vertexRegion }}
+      SOURCE_A_PATH: {{ .Values.job.sourceAPath }}
+      SOURCE_B_PATH: {{ .Values.job.sourceBPath }}
 
   submitterPodTemplate:
     metadata:
@@ -36,8 +40,8 @@ spec:
               value: http://ray-cluster-head-svc:8265
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
+              cpu: 200m
+              memory: 256Mi
 {{- end }}
 {{- if .Values.trainJob.enabled }}
 ---
