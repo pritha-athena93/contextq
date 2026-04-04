@@ -59,9 +59,12 @@ trainWorker:
 
 job:
   enabled: true
+  env: "dev"
   activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 3600
   backoffLimit: 3
+  sourceAPath: "gs://gen-ai-pritha-ray-raw-data/source_a/companies.parquet"
+  sourceBPath: "gs://gen-ai-pritha-ray-raw-data/source_b/companies.parquet"
 
 trainJob:
   enabled: false   # set to true to trigger a training job

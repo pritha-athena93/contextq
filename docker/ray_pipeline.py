@@ -21,11 +21,13 @@ SOURCE_B_PATH = os.environ.get("SOURCE_B_PATH", "")
 
 
 @ray.remote(resources={"worker_pool": 1})
-def ingest_data(source_name: str, source_path: str = "", n: int = 1000) -> pd.DataFrame:
+def ingest_data(source_name: str, source_path: str, n: int = 1000) -> pd.DataFrame:
     if source_path:
         import ray.data as rd
         ds = rd.read_parquet(source_path)
-        return ds.to_pandas()
+        df = ds.to_pandas()
+        df["source"] = source_name
+        return df
 
     return pd.DataFrame({
         "corporate_name": [fake.company() for _ in range(n)],
@@ -213,9 +215,18 @@ def run_training() -> None:
 
 
 
-def run_pipeline() -> None:
-    ds1_ref = ingest_data.remote("dataset_a", SOURCE_A_PATH)
-    ds2_ref = ingest_data.remote("dataset_b", SOURCE_B_PATH)
+def run_pipeline(env: str) -> None:
+    if env == "prod":
+        if not SOURCE_A_PATH or not SOURCE_B_PATH:
+            raise ValueError(
+                "SOURCE_A_PATH and SOURCE_B_PATH must be set in prod mode."
+            )
+        a_path, b_path = SOURCE_A_PATH, SOURCE_B_PATH
+    else:
+        a_path, b_path = "", ""
+
+    ds1_ref = ingest_data.remote("dataset_a", a_path)
+    ds2_ref = ingest_data.remote("dataset_b", b_path)
     df1, df2 = ray.get([ds1_ref, ds2_ref])
     combined = pd.concat([df1, df2], ignore_index=True)
     print(f"Ingested {len(combined)} records from 2 sources.")
@@ -237,14 +248,17 @@ if __name__ == "__main__":
         "--mode",
         choices=["pipeline", "train"],
         default="pipeline",
-        help="pipeline: ingest + resolve + write to Iceberg (worker-pool). "
-             "train: fine-tune entity matcher on GPU (train-pool).",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["dev", "prod"],
+        default="dev",
     )
     args = parser.parse_args()
 
     ray.init()
 
     if args.mode == "pipeline":
-        run_pipeline()
+        run_pipeline(args.env)
     else:
         run_training()
