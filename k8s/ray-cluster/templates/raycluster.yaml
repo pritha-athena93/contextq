@@ -103,6 +103,7 @@ spec:
                   value: {{ .Values.global.projectId | quote }}
                 - name: VERTEX_REGION
                   value: {{ .Values.global.vertexRegion | quote }}
+                # environment variable for tls authentication
                 - name: REQUESTS_CA_BUNDLE
                   value: /etc/ssl/nessie/ca.crt
                 - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
@@ -155,6 +156,11 @@ spec:
                 limits:
                   cpu: {{ .Values.trainWorker.resources.limits.cpu | quote }}
                   memory: {{ .Values.trainWorker.resources.limits.memory }}
+                  # The NVIDIA device plugin makes GPUs an extended resource in Kubernetes. Extended resources have a special rule — when you set only limits,
+                  # Kubernetes automatically sets requests to the same value. So limits: 1 implicitly means requests: 1 too. 
+                  # GPUs are also not overcommittable — unlike CPU which can be throttled or memory which can be limited, you either have the GPU or you don't.
+                  # There's no concept of a "soft" GPU request vs a "hard" limit. So requests and limits will always be the same value anyway, making requests pointless to specify.
+                  # The Kubernetes docs explicitly say: "for extended resources, set only limits." Your setup is correct.
                   nvidia.com/gpu: {{ index .Values.trainWorker.resources.limits "nvidia.com/gpu" | quote }}
               env:
                 - name: RAY_OBJECT_STORE_MEMORY

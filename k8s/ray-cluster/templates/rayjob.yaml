@@ -9,6 +9,7 @@ spec:
     ray.io/cluster: ray-cluster
 
   entrypoint: python /app/ray_pipeline.py --mode pipeline --env {{ .Values.job.env }}
+  # race condition -- the submitter pod exits, it starts a 30-second countdown waiting for the Ray head to confirm SUCCEEDED
   shutdownAfterJobFinishes: true
 
   activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}

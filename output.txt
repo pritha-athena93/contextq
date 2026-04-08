@@ -1,0 +1,12 @@
+Shape: (1400, 6)
+                   corporate_name       revenue     source                  canonical_name      canonical_id  is_resolved
+0  Meyers, Oconnor and Richardson  3.870006e+09  dataset_a  Meyers, Oconnor and Richardson  5aa2bdefa88786c0         True
+1                       Hanna Inc  2.194953e+09  dataset_a                       Hanna Inc  da7a39ae77b5d99e         True
+2                 Griffin-Padilla  4.293131e+09  dataset_a                 Griffin-Padilla  c718d750d7683b15         True
+3                     Perkins PLC  3.487143e+09  dataset_a                     Perkins PLC  3435273929b39c09         True
+4                  Krueger-Bryant  4.717926e+08  dataset_a                  Krueger-Bryant  d30eda9365eed199         True
+5   Sullivan, Phillips and Dillon  4.878136e+09  dataset_a   Sullivan, Phillips and Dillon  452e4c49e0eaee05         True
+6        Brooks, Valencia and Lam  3.805937e+09  dataset_a        Brooks, Valencia and Lam  de91eb07c341da7d         True
+7                    Chavez Group  3.930535e+09  dataset_a                    Chavez Group  28073f9a5f1e19a8         True
+8       Kelley, Carlson and Green  6.414400e+08  dataset_a       Kelley, Carlson and Green  0a519326fc0ebdf2         True
+9                 Johnson-Burnett  2.252479e+09  dataset_a                 Johnson-Burnett  bdc57deed87ffbcd         True

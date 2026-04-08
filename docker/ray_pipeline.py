@@ -19,12 +19,30 @@ NUM_WORKERS       = int(os.environ.get("NUM_WORKERS", "2"))
 SOURCE_A_PATH = os.environ.get("SOURCE_A_PATH", "")
 SOURCE_B_PATH = os.environ.get("SOURCE_B_PATH", "")
 
+# ray.remote is a decorator
+# ingest_data = ray.remote(ingest_data) -- wraps the function
+# without this it would run in head pod driver process
+# head pod has two things running inside it:
+# Head Pod
+# ├── Ray Head process    — the cluster brain (tracks workers, schedules tasks, 
+# │                         runs the dashboard). Always running.
+# │
+# └── Driver process      — YOUR script (ray_pipeline.py). The main() that 
+#                           calls ingest_data.remote(), ray.get(), etc.
+#                           Starts when the RayJob submitter triggers it.
+#                           Exits when the pipeline finishes.
 
 @ray.remote(resources={"worker_pool": 1})
 def ingest_data(source_name: str, source_path: str, n: int = 1000) -> pd.DataFrame:
     if source_path:
+        # inside the if block so that it imports only if needed
+        # doesn't matter in this case as the dockerfile importa
+        # entire ray package
         import ray.data as rd
         ds = rd.read_parquet(source_path)
+        # converts whatever data structure you have into a pandas 
+        # DataFrame — a table with named columns you can print, 
+        # slice, and inspect easily
         df = ds.to_pandas()
         df["source"] = source_name
         return df
@@ -40,7 +58,10 @@ _GEMINI_BATCH_SIZE  = 50
 _GEMINI_MAX_RETRIES = 5
 _GEMINI_BASE_BACKOFF = 1.0  # seconds; doubles each retry for 429s
 
-
+# ray task is a remote function execution
+# Worker pod = machine
+# Task = job run on that machine
+# Actor = a long-lived process on that machine
 @ray.remote(resources={"worker_pool": 1})
 class EntityResolver:
     def __init__(self):
@@ -53,6 +74,8 @@ class EntityResolver:
     def _call_with_retry(self, prompt: str) -> str:
         """Call Gemini with retry on 429 and transient errors. Raises on exhaustion."""
         import time
+        # low-level shared plumbing (retry logic, auth, exception types) 
+        # that all Google Cloud libraries use under the hood
         from google.api_core import exceptions as gex
 
         for attempt in range(_GEMINI_MAX_RETRIES):
@@ -60,10 +83,14 @@ class EntityResolver:
                 return self._model.generate_content(prompt).text.strip()
 
             except gex.ResourceExhausted:
-                # 429 — exponential backoff
+                # 429 — HTTP status code - "Too Many Requests - exponential backoff
                 if attempt == _GEMINI_MAX_RETRIES - 1:
+                    # re-raises the current exception, letting it propagate up
                     raise
+                # 2 to the power of attempt
                 wait = _GEMINI_BASE_BACKOFF * (2 ** attempt)
+                # printed as (attempt 1/5) (attempt 2/5) etc
+                # 1.0 to 1, :.0f - f = float, .0 = 0 decimal places
                 print(f"[Gemini] 429 rate-limited (attempt {attempt + 1}/{_GEMINI_MAX_RETRIES}), "
                       f"retrying in {wait:.0f}s …")
                 time.sleep(wait)
@@ -85,7 +112,23 @@ class EntityResolver:
             "one per line in the same order, prefixed with the same number. "
             "No explanations:\n" + numbered
         )
+
+        # Return only the canonical legal names of these companies, 
+        # one per line in the same order, prefixed with the same number. 
+        # No explanations:
+        # 1. Acme Corp
+        # 2. Google LLC
+        # 3. Apple Inc
+
         text = self._call_with_retry(prompt)
+
+        # strip -- truncates,
+        # splitlines -- returns a list comprising of the string of each line
+        # output of text --
+        # 1. Alphabet Inc.
+        # 2. Apple Inc.
+        # 3) Microsoft Corporation
+
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         result = []
         for line in lines:
@@ -93,6 +136,7 @@ class EntityResolver:
                 line = line.split(". ", 1)[1]
             elif ") " in line:
                 line = line.split(") ", 1)[1]
+            # ["Alphabet Inc.", "Apple Inc.", "Microsoft Corporation"]
             result.append(line.strip())
 
         if len(result) != len(names):
@@ -110,6 +154,7 @@ class EntityResolver:
         canonical_names: list[str] = []
 
         for i in range(0, len(names), _GEMINI_BATCH_SIZE):
+            # batch further from 200 to 50
             chunk = names[i : i + _GEMINI_BATCH_SIZE]
             canonical_names.extend(self._resolve_chunk(chunk))
             # brief pause between batches to stay within RPM quota
@@ -133,12 +178,21 @@ def write_to_iceberg(df: pd.DataFrame) -> None:
     catalog = load_catalog(
         "nessie",
         **{
+            # Nessie's REST API lives (in-cluster DNS)
             "uri":       NESSIE_URI,
+            # Nessie branch to read/write. Like git
             "ref":       "main",
+            # the location for actual data files
             "warehouse": ICEBERG_WAREHOUSE,
         },
     )
 
+    # Iceberg organizes tables in namespaces — 
+    # like a database/schema in SQL. 
+    # default.corporate_registry means table corporate_registry in namespace default
+    # "default"    # string
+    # ("default")  # also a string — parentheses don't make a tuple
+    # ("default",) # tuple with one element ← the comma does it
     if ("default",) not in catalog.list_namespaces():
         catalog.create_namespace("default")
 
@@ -291,7 +345,13 @@ def run_pipeline(env: str) -> None:
 
     resolver = EntityResolver.remote()
     batch_size = 200
+    # iloc[0 : 200]   → rows 0–199
+    # iloc[200 : 400] → rows 200–399
+    # iloc[400 : 600] → rows 400–599
+    # ...
+    # iloc[1800:2000] → rows 1800–1999
     batches = [combined.iloc[i : i + batch_size] for i in range(0, len(combined), batch_size)]
+    # ray.get() waits until the .remote() tasks finish in parallel
     resolved_batches = ray.get([resolver.resolve_batch.remote(b) for b in batches])
     resolved_df = pd.concat(resolved_batches, ignore_index=True)
     print(f"Resolved {len(resolved_df)} entities.")
@@ -300,6 +360,9 @@ def run_pipeline(env: str) -> None:
     print(f"Pipeline complete. {len(resolved_df)} records written to corporate_registry.")
 
 
+# every Python file has a built-in variable __name__
+# if run directly: python ray_pipeline.py -- __main__
+# if imported by another file: import ray_pipeline -- ray_pipeline
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
