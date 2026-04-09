@@ -39,7 +39,7 @@ worker:
   objectStoreMemory: "2000000000"
   spillVolumeSizeLimit: 20Gi
   autoscalerOptions:
-    idleTimeoutSeconds: 60
+    idleTimeoutSeconds: 300
     upscalingMode: Default
 
 trainWorker:
@@ -59,13 +59,18 @@ trainWorker:
 
 job:
   enabled: true
+  env: "prod"
   activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 3600
+  gracePeriodSeconds: 300
   backoffLimit: 3
+  sourceAPath: "gs://gen-ai-pritha-ray-raw-data/source_a/companies.parquet"
+  sourceBPath: "gs://gen-ai-pritha-ray-raw-data/source_b/companies.parquet"
 
 trainJob:
-  enabled: false   # set to true to trigger a training job
+  enabled: false
   modelOutputPath: "gs://gen-ai-pritha-ray-iceberg-warehouse/models/entity-matcher"
-  numWorkers: 2
+  numWorkers: 1
   activeDeadlineSeconds: 7200
   ttlSecondsAfterFinished: 3600
+  gracePeriodSeconds: 300

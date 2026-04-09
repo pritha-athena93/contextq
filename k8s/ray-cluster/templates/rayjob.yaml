@@ -8,17 +8,23 @@ spec:
   clusterSelector:
     ray.io/cluster: ray-cluster
 
-  entrypoint: python /app/ray_pipeline.py --mode pipeline
+  entrypoint: python /app/ray_pipeline.py --mode pipeline --env {{ .Values.job.env }}
+  # race condition -- the submitter pod exits, it starts a 30-second countdown waiting for the Ray head to confirm SUCCEEDED
   shutdownAfterJobFinishes: true
 
   activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
   ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  jobDeploymentStatusTransitionGracePeriodSeconds: {{ .Values.job.gracePeriodSeconds | default 300 }}
 
   runtimeEnvYAML: |
     env_vars:
       ICEBERG_WAREHOUSE: {{ include "ray-cluster.icebergWarehouse" . }}
       NESSIE_URI: {{ .Values.nessie.uri }}
       RAY_ADDRESS: http://ray-cluster-head-svc:8265
+      GOOGLE_CLOUD_PROJECT: {{ .Values.global.projectId }}
+      VERTEX_REGION: {{ .Values.global.vertexRegion }}
+      SOURCE_A_PATH: {{ .Values.job.sourceAPath }}
+      SOURCE_B_PATH: {{ .Values.job.sourceBPath }}
 
   submitterPodTemplate:
     metadata:
@@ -36,8 +42,8 @@ spec:
               value: http://ray-cluster-head-svc:8265
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
+              cpu: 200m
+              memory: 256Mi
 {{- end }}
 {{- if .Values.trainJob.enabled }}
 ---
@@ -81,6 +87,6 @@ spec:
               value: http://ray-cluster-head-svc:8265
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
+              cpu: 200m
+              memory: 256Mi
 {{- end }}

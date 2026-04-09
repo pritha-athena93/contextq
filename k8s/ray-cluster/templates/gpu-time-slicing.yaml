@@ -1,7 +1,12 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  # name needs to be time-slicing-config
+  # enables mig or timeslicing 
+  # a single GPU among multiple pods 
+  # by creating virtual replicas
   name: time-slicing-config
+  # needs to be in the GPU operator namespace
   namespace: kube-system
 data:
   any: |-

@@ -104,6 +104,28 @@ spec:
             matchLabels:
               ray.io/node-type: head
 ---
+# allows Ray workers (ingress here, egress below) 
+# to talk to each other, needed for ray train
+# PyTorch Distributed Data Parallel (DDP) -
+# dataset divided into chunks, processed by each worker
+# AllReduce averages the gradients of all workers
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-workers-from-workers
+  namespace: ray
+spec:
+  podSelector:
+    matchLabels:
+      ray.io/node-type: worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              ray.io/node-type: worker
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -120,6 +142,10 @@ spec:
         - podSelector:
             matchLabels:
               ray.io/node-type: head
+    - to:
+        - podSelector:
+            matchLabels:
+              ray.io/node-type: worker
     - to:
         - ipBlock:
             cidr: 10.2.0.243/32
@@ -187,6 +213,17 @@ spec:
         - podSelector:
             matchLabels:
               ray.io/node-type: worker
+    # autoscaler sidecar needs to reach K8s API server
+    - to:
+        - ipBlock:
+            cidr: 10.2.0.1/32   # kubernetes.default ClusterIP
+      ports:
+        - port: 443
+    - to:
+        - ipBlock:
+            cidr: 172.16.0.0/28  # GKE master CIDR
+      ports:
+        - port: 443
 
     - to:
         - ipBlock:
@@ -300,8 +337,32 @@ spec:
       ports:
         - protocol: TCP
           port: 8265
-# KubeRay operator needs to reach the Ray head and the K8s API server.
+# KubeRay operator (kuberay-system) polls head for job status
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-head-from-kuberay-operator
+  namespace: ray
+spec:
+  podSelector:
+    matchLabels:
+      ray.io/node-type: head
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kuberay-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kuberay-operator
+      ports:
+        - port: 8265
+        - port: 6379
+---
+# Redundant — operator runs in kuberay-system not ray namespace. Kept for reference.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -525,6 +586,17 @@ spec:
               - 192.168.0.0/16
       ports:
         - port: 443
+    # KubeRay operator polls Ray head for job status
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ray
+          podSelector:
+            matchLabels:
+              ray.io/node-type: head
+      ports:
+        - port: 8265
+        - port: 6379
 
     - to:
         - ipBlock:

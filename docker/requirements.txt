@@ -4,6 +4,9 @@ faker==24.0.0
 pandas==2.2.1
 pyarrow==15.0.2
 google-cloud-aiplatform==1.49.0
+# tells pip to also look at PyTorch's own package index, 
+# needed for torch==2.3.1+cpu (cpu variant)
+# cpu variant not in pypi - python package index
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.3.1+cpu
 sentence-transformers==3.0.1
