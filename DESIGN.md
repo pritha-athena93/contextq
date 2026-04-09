@@ -17,6 +17,18 @@
 11. [Spot Instance Resilience and Failure Simulation](#11-spot-instance-resilience-and-failure-simulation)
 12. [Key Tradeoffs and Design Decisions](#12-key-tradeoffs-and-design-decisions)
 13. [Runbook Snippets](#13-runbook-snippets)
+14. [Training Pipeline Deep Dive](#14-training-pipeline-deep-dive)
+15. [Container Image Design](#15-container-image-design)
+16. [Operations and Debugging Journal](#16-operations-and-debugging-journal)
+    - cert-manager CA secret deleted on re-apply
+    - RayJob `ValidationFailed` — TTL on non-shutdown job
+    - `ImagePullBackOff` — arm64 image on amd64 cluster
+    - Rebuilt image still missing packages — Docker layer cache
+    - `PENDING_NODE_ASSIGNMENT` — insufficient `worker_pool` slots
+    - `torch.distributed` AllReduce blocked by NetworkPolicy
+    - HuggingFace SSL failure due to `REQUESTS_CA_BUNDLE` override
+    - `sentence_transformers` v3 API incompatibility (current blocker)
+    - Accessing Ray Dashboard without port-forward
 
 ---
 
@@ -867,3 +879,541 @@ kubectl scale raycluster ray-cluster -n ray \
 ./scripts/simulate-spot-failure.sh          # live
 ./scripts/simulate-spot-failure.sh --dry-run  # preview
 ```
+
+---
+
+## 14. Training Pipeline Deep Dive
+
+### Why train a model at all
+
+The pipeline uses Gemini to resolve entity names — expensive (~$0.002/call), slow (1–2s per batch), requires internet. The trained SentenceTransformer embedding model replaces LLM calls for future resolution:
+
+1. **Pipeline phase**: Gemini canonicalises 2,000 names → writes to Iceberg
+2. **Training phase**: use Gemini's output as labelled data → train `all-MiniLM-L6-v2` on name pairs
+3. **Inference phase**: embed new name → cosine similarity search against known canonical embeddings → no LLM needed
+
+The model is not learning revenue patterns. It is learning that `"IBM"`, `"I.B.M."`, and `"International Business Machines"` should cluster close in vector space.
+
+---
+
+### What `build_training_pairs()` produces
+
+Reads `corporate_registry` from Iceberg. Groups rows by `canonical_id` (SHA256 of Gemini's canonical name):
+
+**Positive pairs (`label = 1.0`)**: every combination of name variants within the same canonical group.
+```
+canonical_id: a3b9...
+  variants: ["IBM", "I.B.M.", "International Business Machines Corp."]
+  pairs: [("IBM", "I.B.M."), ("IBM", "International Business Machines Corp."), ...]
+```
+
+**Negative pairs (`label = 0.0`)**: two names sampled from *different* `canonical_id` groups.
+```
+("IBM", "Acme Corp")  →  0.0
+("Tata", "Apple Inc") →  0.0
+```
+
+Target count: equal number of negative and positive pairs (balanced dataset). `target_neg = len(positive_pairs)`. Up to 10× attempts per pair to find mismatched `canonical_id` — avoids infinite loop on skewed data.
+
+Risk: random negative might coincidentally be the same entity — acceptable noise at 2,000 rows. At scale, explicit negative mining (hard negatives) would be more rigorous.
+
+Final output: list of `(text_a, text_b, float_label)` tuples, shuffled with `seed=42` for reproducibility.
+
+---
+
+### SentenceTransformer and `all-MiniLM-L6-v2`
+
+**SentenceTransformer** is a library that wraps BERT-family models for efficient sentence embedding. It adds a pooling layer on top of BERT's token outputs to produce a single fixed-size vector per sentence.
+
+**`all-MiniLM-L6-v2`**: 22M-parameter distilled version of BERT. 6 transformer layers, 384-dimensional output embeddings. Fast enough for production inference. Pre-trained on 1B+ sentence pairs for general semantic similarity.
+
+**BERT pooler vs mean pooling:**
+- BERT was originally trained with a `[CLS]` token pooler head (linear + tanh) for classification tasks
+- SentenceTransformer discards the pooler and uses **mean pooling** instead — averages all token embeddings to produce the sentence embedding. This is empirically better for similarity tasks.
+- The BERT pooler parameters are still present in the model weights but are never called in the forward pass → requires `find_unused_parameters=True` in DDP (see below)
+
+---
+
+### PyTorch DDP and AllReduce
+
+Each training worker (Ray Train actor) holds a **full copy** of the model. Data is split into shards — worker 0 gets rows 0–N/k, worker 1 gets rows N/k–2N/k, etc.
+
+Training step per worker:
+```
+1. Forward pass: compute embeddings for text_a and text_b batch
+2. Compute CosineEmbeddingLoss(emb_a, emb_b, labels)
+3. loss.backward() → compute gradients locally
+4. AllReduce (NCCL): average gradients across all workers
+   → all workers now have identical averaged gradients
+5. optimizer.step() → update model weights
+   → all workers remain in sync
+```
+
+AllReduce is a collective operation — every worker sends its gradients and receives the average simultaneously. No parameter server needed. This is `torch.distributed` DistributedDataParallel (DDP), not model parallelism (that would be FSDP/ZeRO for models too large to fit on one GPU).
+
+**`find_unused_parameters=True`** in `prepare_model()`: required because the BERT pooler weights are in `model.parameters()` but never used in the forward pass. DDP normally errors if a parameter has no gradient after backward. This flag makes DDP skip those parameters during AllReduce.
+
+---
+
+### Training loop mechanics
+
+```python
+# collate_fn: converts list of (text_a, text_b, label) tuples into batched tensors
+texts_a = [pair[0] for pair in batch]
+texts_b = [pair[1] for pair in batch]
+labels  = torch.tensor([pair[2] for pair in batch])
+
+# tokenizer: converts raw text → token IDs + attention masks
+enc = tokenizer(texts_a + texts_b, padding=True, truncation=True, return_tensors="pt")
+# "padding=True" pads all sequences to same length within batch
+# "truncation=True" clips sequences longer than model's max (512 tokens)
+# texts_a and texts_b concatenated → one forward pass encodes both halves
+
+# forward: model produces token embeddings → mean pool → 384-dim sentence vectors
+embeddings = model(**enc)   # shape: [2*batch_size, 384]
+emb_a, emb_b = embeddings.chunk(2)  # split back
+
+# CosineEmbeddingLoss:
+# label=1.0  → loss = 1 - cosine_similarity(emb_a, emb_b)
+# label=-1.0 → loss = max(0, cosine_similarity - margin)
+# NOTE: CosineEmbeddingLoss expects -1/+1 labels, not 0/1
+#       build_training_pairs uses 1.0 (match) and -1.0 (no match)
+loss = criterion(emb_a, emb_b, labels)
+
+optimizer.zero_grad()
+loss.backward()   # → triggers AllReduce across DDP workers
+optimizer.step()
+```
+
+**AdamW** optimizer: Adam (adaptive learning rates per parameter) + weight decay regularisation. Standard for fine-tuning BERT-family models. Learning rate `2e-5` — small to avoid destroying pre-trained weights.
+
+**`ray.train.report({"epoch": e, "loss": avg_loss})`** after each epoch: propagates metrics to the driver process, visible in Ray Dashboard and Cloud Logging.
+
+**Rank-0 model save**: `ray.train.get_context().get_world_rank() == 0` — only the first worker saves the model to GCS. All workers hold identical models after AllReduce; saving from all workers would produce redundant writes and race conditions.
+
+---
+
+### Ray Train internals
+
+`ray.train.torch` is a Ray submodule that wraps PyTorch distributed. When `TorchTrainer.fit()` is called:
+
+1. Ray launches `num_workers` actor processes on nodes matching `ScalingConfig`
+2. Ray sets up `torch.distributed` process group (NCCL for GPU, Gloo for CPU)
+3. Each actor runs `train_loop_per_worker(config)` independently
+4. `prepare_model(model)` wraps the model in `DistributedDataParallel`
+5. `prepare_optimizer(optimizer)` wraps for distributed parameter sync
+6. Training proceeds; AllReduce happens automatically in `loss.backward()`
+7. `ray.train.report()` collects metrics from all workers and aggregates them
+
+`get_world_rank()` returns the worker's index (0, 1, ..., N-1) within the training run. Equivalent to `torch.distributed.get_rank()` but Ray-managed.
+
+**`ScalingConfig(num_workers=1, use_gpu=False, resources_per_worker={"worker_pool": 1})`**: trains on CPU workers in the default worker pool. Single worker means no DDP (no AllReduce needed). Using `worker_pool` (not `train_worker`) keeps training on the same Spot nodes as ingestion — simpler at the cost of GPU acceleration.
+
+---
+
+## 15. Container Image Design
+
+### Two Dockerfiles: CPU workers and GPU train workers
+
+| Image | Base | Torch | Used by |
+|---|---|---|---|
+| `ray-pipeline:<sha>` | `rayproject/ray:2.10.0-py311` | `torch==2.3.1+cpu` (pinned) | head, workers, submitter pods |
+| `ray-pipeline:<sha>-gpu` | `rayproject/ray:2.10.0-py311-gpu` | Not pinned (CUDA torch from base) | train-pool workers only |
+
+**Why pin CPU torch?** The non-GPU base image has no CUDA; PyPI's default torch wheel includes CUDA binaries (~2GB). Pinning `torch==2.3.1+cpu` (from `https://download.pytorch.org/whl/cpu`) installs the 200MB CPU-only wheel instead.
+
+**Why NOT pin GPU torch?** The GPU base image ships with `torch` compiled against its specific CUDA version. Installing any other torch via pip overwrites it and breaks CUDA. `requirements-gpu.txt` omits the torch pin so `pip install` skips it.
+
+```
+requirements.txt (CPU):
+  --extra-index-url https://download.pytorch.org/whl/cpu
+  torch==2.3.1+cpu          ← explicit CPU wheel
+  sentence-transformers==...
+
+requirements-gpu.txt (GPU):
+  sentence-transformers==... ← no torch line; keeps base image's CUDA torch
+```
+
+### Model weight pre-loading at build time
+
+```dockerfile
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+               SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+```
+
+This line **downloads the model weights at Docker build time** and caches them in the image layer at `~/.cache/huggingface/`. At runtime, `HF_HUB_OFFLINE=1` prevents any network call to HuggingFace Hub — the model loads from the baked-in cache.
+
+**Why not use `requirements.txt`?** HuggingFace model weights are not Python packages. They cannot be installed via `pip`. They must be fetched by the HuggingFace `hub` library during model instantiation.
+
+### `HF_HUB_OFFLINE` — two places
+
+Set in `raycluster.yaml` (pod-level env var) so all pods inherit it. Also set inside `train_loop_per_worker()`:
+
+```python
+os.environ["HF_HUB_OFFLINE"] = "1"
+```
+
+This is defensive redundancy. The pod env var is authoritative. The in-code assignment covers the edge case of someone running the script outside the cluster (e.g., local dev) without setting the env var — prevents an unexpected network call to HuggingFace Hub failing on a machine without internet access.
+
+---
+
+### TLS for Nessie: self-signed certificates
+
+A **self-signed certificate** is one signed by its own private key rather than by a trusted third-party Certificate Authority (CA). Browsers reject them by default ("unknown authority"). For internal cluster services this is fine — both sides of the connection are under our control.
+
+How it works here:
+1. `cert-manager` generates a self-signed root CA (a CA that trusts itself)
+2. `cert-manager` issues a server certificate for Nessie, signed by that CA
+3. Nessie serves HTTPS on `:19120` using this certificate
+4. The root CA certificate is stored in the `nessie-root-ca` K8s Secret in `nessie-ns`
+5. `reflector` copies that secret to the `ray` namespace
+6. Ray pods mount the CA cert; `REQUESTS_CA_BUNDLE` env var points to it
+7. Python's `requests` library (used by pyiceberg) loads the CA → trusts Nessie's certificate
+
+Without step 6–7, pyiceberg throws `SSLError: certificate verify failed: unable to get local issuer certificate`.
+
+---
+
+## 16. Operations and Debugging Journal
+
+### Incident: RayJob shows `Failed` despite job succeeding
+
+**Symptom**: `kubectl get rayjob -n ray` shows `JOB STATUS: FAILED`, but Ray Dashboard and logs showed the job completed successfully. Error: `JobDeploymentStatusTransitionGracePeriodExceeded`.
+
+**Root cause**: KubeRay's default grace period for job status propagation is 30 seconds. The submitter pod exits after job submission; the Ray cluster then processes the job and updates job status via the Dashboard API. If the status update takes longer than 30 seconds (cluster warm-up, Iceberg write latency), KubeRay marks the deployment as failed even if the job succeeded.
+
+**Fix**: Added `jobDeploymentStatusTransitionGracePeriodSeconds: 300` to both RayJob specs in [k8s/ray-cluster/templates/rayjob.yaml](k8s/ray-cluster/templates/rayjob.yaml). Controlled via `job.gracePeriodSeconds` and `trainJob.gracePeriodSeconds` in [values.yaml](k8s/ray-cluster/values.yaml).
+
+---
+
+### Incident: Autoscaler sidecar crashlooping
+
+**Symptom**: Head pod had a second container (`autoscaler`) in `CrashLoopBackOff`. Log: `ConnectTimeout: HTTPSConnectionPool(host='kubernetes.default', port=443)`.
+
+**Root cause (1)**: `enableInTreeAutoscaling: true` was missing from the `RayCluster` spec. The autoscaler sidecar container was never being injected. Added to [k8s/ray-cluster/templates/raycluster.yaml](k8s/ray-cluster/templates/raycluster.yaml):
+```yaml
+spec:
+  enableInTreeAutoscaling: true
+```
+
+**Root cause (2)**: The `default-deny-all` NetworkPolicy in the `ray` namespace blocked the head pod's egress to the Kubernetes API server. The autoscaler needs to create and delete worker pods via the K8s API.
+
+**Fix**: Added two egress rules to `allow-head-egress` in [k8s/app/networkpolicy.yaml](k8s/app/networkpolicy.yaml):
+```yaml
+- to:
+    - ipBlock:
+        cidr: 10.2.0.1/32   # kubernetes.default ClusterIP
+  ports:
+    - port: 443
+- to:
+    - ipBlock:
+        cidr: 172.16.0.0/28  # GKE master CIDR
+  ports:
+    - port: 443
+```
+
+**Gotcha**: Deleting and recreating the head pod was necessary after applying the new NetworkPolicy. Existing pods do not automatically pick up updated NetworkPolicy rules — the kernel `iptables`/`nftables` rules are refreshed when a pod is (re)created.
+
+---
+
+### Incident: KubeRay operator couldn't poll Ray head for job status
+
+**Symptom**: `kubectl describe rayjob` showed operator unable to fetch job status from Ray. Job appeared stuck.
+
+**Root cause**: `allow-kuberay-operator-egress` in `kuberay-system` only allowed port 443 (K8s API). Ray Dashboard runs on port 8265; Redis/GCS on 6379. The operator polls both to determine job status.
+
+**Fix**: Added to `allow-kuberay-operator-egress` in `kuberay-system`:
+```yaml
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ray
+      podSelector:
+        matchLabels:
+          ray.io/node-type: head
+  ports:
+    - port: 8265
+    - port: 6379
+```
+
+Also added `allow-head-from-kuberay-operator` ingress policy in the `ray` namespace to allow the operator to reach the head pod on those ports.
+
+---
+
+### Incident: Workers spinning up and down between pipeline and train job
+
+**Symptom**: Train job waited 2–3 minutes before starting. During the wait, worker pods were being deleted immediately after the pipeline job finished.
+
+**Root cause**: `idleTimeoutSeconds: 60` caused the Ray autoscaler to kill idle workers within 1 minute of them having no tasks. The pipeline job finished, workers went idle, autoscaler removed them. Train job then had to wait for GKE Spot provisioning (~90–120s) to bring fresh workers back.
+
+**Fix**: Raised `idleTimeoutSeconds: 300` in `autoscalerOptions` in [values.yaml](k8s/ray-cluster/values.yaml:41). Workers now stay alive for 5 minutes after going idle — long enough for the train job to start and claim them.
+
+---
+
+### Design note: both jobs use `worker_pool`
+
+`ray-train-job` uses `ScalingConfig(resources_per_worker={"worker_pool": 1})`, not `{"train_worker": 1}`. This means training runs on the same CPU Spot worker nodes as the pipeline, not the GPU train-pool.
+
+Rationale: `numWorkers: 1`, CPU training on a 22M parameter model is fast enough. The `train-pool` (n1-standard-8 + T4) is expensive Spot hardware; reserving it for GPU workloads only. If training is promoted to GPU, change `resources_per_worker={"train_worker": 1, "GPU": 1}` and `use_gpu=True`.
+
+**Contention**: when both jobs run simultaneously, they compete for `worker_pool` resources. With only 2 Spot VMs available and each holding `worker_pool: 1`, one job blocks the other. Pipeline has scheduling priority (submitted first). Train job waits. Workaround: sequence jobs (pipeline first, train after), or provision more Spot VMs.
+
+---
+
+### RayJob lifecycle in production
+
+`kubectl apply` over an existing `RayJob` fails for immutable fields. Pattern:
+
+```bash
+kubectl delete rayjob ray-pipeline-job -n ray
+helm upgrade --install ray-cluster k8s/ray-cluster \
+  --namespace ray \
+  --set image.tag=<sha> \
+  --set job.enabled=true
+```
+
+Alternative for ad-hoc runs: `ray job submit` CLI bypasses RayJob CRDs entirely and submits directly to the running cluster's Dashboard API. RayJob CRDs are for scheduled/GitOps-managed jobs; `ray job submit` is for interactive or CI-triggered runs without CRD lifecycle management.
+
+---
+
+### NetworkPolicy walkthrough: all policies, all namespaces
+
+#### `ray` namespace
+
+| Policy | Direction | Who | What | Why |
+|---|---|---|---|---|
+| `default-deny-all` | Ingress + Egress | all pods | deny everything | baseline zero-trust |
+| `allow-job-submitter-egress` | Egress | `ray.io/component: job-submitter` | → head:8265, → kube-dns:53 | submitter pod needs to reach Dashboard to submit job |
+| `allow-head-from-submitter` | Ingress | head | from job-submitter:8265 | head accepts job submission |
+| `allow-head-from-workers` | Ingress | head | from workers (all ports) | workers heartbeat, GCS, task result reporting |
+| `allow-workers-from-head` | Ingress | workers | from head (all ports) | head dispatches tasks to workers |
+| `allow-workers-from-workers` | Ingress | workers | from workers (all ports) | PyTorch DDP AllReduce peer-to-peer gradient sync during distributed training |
+| `allow-worker-egress` | Egress | workers | → head, → workers, → nessie:19120, → internet:443, → metadata:988, → kube-dns:53 | task execution, Iceberg writes, GCS/Vertex AI, Workload Identity |
+| `allow-head-egress` | Egress | head | → workers, → K8s API:443 (10.2.0.1+172.16.0.0/28), → nessie:19120, → internet:443, → metadata:988, → kube-dns:53 | schedule tasks, autoscaler sidecar K8s API, Iceberg, GCS, Workload Identity |
+| `allow-submit-to-ray-head` | Egress | `job-name: ray-pipeline-job` | → head:8265, → kube-dns:53 | legacy/redundant with job-submitter rule |
+| `allow-head-from-rayjob` | Ingress | head | from `job-name: ray-pipeline-job`:8265 | head accepts submission from pipeline job pod |
+| `allow-head-from-kuberay-operator` | Ingress | head | from kuberay-system operator:8265,6379 | operator polls head for job status and cluster health |
+| `allow-kuberay-egress` | Egress | kuberay-operator (ray ns) | → head:8265,6379, → internet:443, → kube-dns:53 | redundant — operator runs in kuberay-system not ray ns. Kept for reference. |
+
+#### `nessie-ns` namespace
+
+| Policy | Direction | Who | What | Why |
+|---|---|---|---|---|
+| `default-deny-all` | Ingress + Egress | all pods | deny everything | baseline zero-trust |
+| `allow-nessie-from-ray` | Ingress | nessie pod | from ray namespace:19120 | Ray workers write/read Iceberg metadata |
+| `allow-nessie-egress` | Egress | nessie pod | → postgres:5432, → internet:443, → metadata:988, → kube-dns:53 | catalog persistence, GCS (Iceberg data files), Workload Identity |
+| `allow-postgres-from-nessie` | Ingress | postgres pod | from nessie:5432 | Nessie reads/writes catalog state to Postgres |
+
+#### `kuberay-system` namespace
+
+| Policy | Direction | Who | What | Why |
+|---|---|---|---|---|
+| `default-deny-all` | Ingress + Egress | all pods | deny everything | baseline zero-trust |
+| `allow-kuberay-operator-ingress` | Ingress | kuberay-operator | from master CIDR 172.16.0.0/28:9443, from GKE nodes 10.0.0.0/8:8080 | K8s API server webhook calls + health probes |
+| `allow-kuberay-operator-egress` | Egress | kuberay-operator | → K8s API (10.2.0.1+172.16.0.0/28):443, → internet:443, → ray head:8265,6379, → kube-dns:53 | reconcile CRDs, pull operator image, poll Ray head status |
+
+#### Why workers and head need internet egress
+
+GCS (`storage.googleapis.com`) and Vertex AI (`aiplatform.googleapis.com`) are public Google APIs with public IP addresses. Traffic to them leaves the VPC even from GKE — there is no private IP for these services unless you configure **Private Google Access** with `restricted.googleapis.com` (`199.36.153.4/30`). The `except` blocks in the CIDR rules (`0.0.0.0/0 except 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16`) prevent workers from reaching any other private network while still allowing Google API traffic over internet IPs.
+
+#### GKE metadata server (`169.254.169.252:988`)
+
+Link-local address on every GKE node. Handles the Workload Identity token exchange:
+```
+Pod (ray-ksa) → metadata server:988 → GKE WI → short-lived OAuth2 token for ray-sa
+```
+Port 988 is specific to GKE's metadata server implementation. Without this egress rule, all GCP API calls fail with "unable to get application default credentials".
+
+---
+
+### Incident: cert-manager CA secret deleted on manifest re-apply
+
+**Symptom**: After re-applying `k8s/third-party/nessie-tls.yaml`, Nessie pod failed with TLS errors. `kubectl get secret nessie-root-ca -n nessie-ns` showed the secret was gone. cert-manager logs showed it being deleted immediately after apply.
+
+**Root cause**: `cert-manager-values.yaml` has `--enable-certificate-owner-ref=true`. This flag makes cert-manager set an owner reference on the Secret it generates, pointing to the Certificate CR. When the Certificate CR is deleted (even momentarily during a re-apply of the manifest), cert-manager garbage-collects the associated Secret. On a fresh apply, the Certificate CR is recreated but the Secret is gone — cert-manager issues a new cert and new private key, breaking any pods that mounted the old CA.
+
+**Fix**: Do not re-apply the TLS manifest if the cluster is running. If you must re-apply (schema change, renewal), delete the Certificate CRs first and wait for the secrets to be recreated before restarting Nessie.
+
+**Longer-term fix**: Set `--enable-certificate-owner-ref=false` in `cert-manager-values.yaml` so Secrets outlive Certificate CR deletes.
+
+**Note**: The `cert-manager apicheck` one-off error seen in GCP logs on April 2nd was a separate event (apiserver connectivity probe run once during cert-manager startup), not the cause of this incident.
+
+---
+
+### Incident: RayJob `ValidationFailed` — TTL on non-shutdown job
+
+**Symptom**: `kubectl get rayjob -n ray` showed `ray-train-job` stuck in `ValidationFailed` immediately on creation.
+
+**Root cause**: The RayJob spec had `shutdownAfterJobFinishes: false` (the default when the field is missing) combined with `ttlSecondsAfterFinished` set. KubeRay validation rejects this combination — TTL cleanup only makes sense if the job shuts down after finishing.
+
+**Fix**: Ensure `shutdownAfterJobFinishes: true` is set in the RayJob template when `ttlSecondsAfterFinished` is also set. The Helm template in [k8s/ray-cluster/templates/rayjob.yaml](k8s/ray-cluster/templates/rayjob.yaml) should have both fields present.
+
+---
+
+### Incident: `ImagePullBackOff` — arm64 image pushed to amd64 cluster
+
+**Symptom**: Worker pods stuck in `ImagePullBackOff`. Error: `no match for platform in manifest: not found`.
+
+**Root cause**: Docker image was built on Apple Silicon (arm64) without specifying target platform. GKE nodes are x86-64 (amd64). The arm64 manifest was pushed to the registry; GKE nodes couldn't pull it.
+
+**Fix**: Always build with explicit platform flag:
+```bash
+docker buildx build --platform linux/amd64 --push \
+  -t asia-south1-docker.pkg.dev/gen-ai-pritha/ray-platform/ray-pipeline:2.10.0 .
+```
+
+---
+
+### Incident: Rebuilt image still missing packages — Docker layer cache
+
+**Symptom**: After adding `torch` to `requirements.txt` and rebuilding, the running workers still couldn't import torch. Log: `ModuleNotFoundError: No module named 'torch'`.
+
+**Root cause**: Docker layer cache served the old `pip install` layer because `requirements.txt` content hash hadn't changed in Docker's view (the file was sometimes cached from before the edit). Workers used stale pods from before the image push; `imagePullPolicy: Always` only re-pulls on pod creation, not while a pod is running.
+
+**Fix (image)**: Force a clean rebuild to bust the pip cache:
+```bash
+docker buildx build --platform linux/amd64 --no-cache --push ...
+```
+
+**Fix (pods)**: Delete running pods to force KubeRay to recreate them with the new image:
+```bash
+kubectl delete pod -n ray -l ray.io/node-type=worker
+kubectl delete pod -n ray -l ray.io/node-type=head
+```
+Verify new image digest after restart:
+```bash
+kubectl get pod -n ray -l ray.io/node-type=worker \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.status.containerStatuses[0].imageID}{"\n"}{end}'
+```
+
+---
+
+### Incident: `PENDING_NODE_ASSIGNMENT` — insufficient `worker_pool` slots
+
+**Symptom**: Ray Dashboard showed one task stuck in `Waiting for scheduling: 1`. `TorchTrainer` with `num_workers=2` needed 2 `worker_pool` slots but only 1 worker pod existed (holding the single `worker_pool: 1` resource).
+
+**Root cause**: `worker.initialReplicas` was set to 1. The second training worker had no slot. Ray's in-tree autoscaler could not provision a new node because the head pod was missing K8s API egress in the NetworkPolicy (separate incident — autoscaler sidecar needed K8s API to create pods).
+
+**Fix**: Scale workers up manually:
+```bash
+helm upgrade ray-cluster ./k8s/ray-cluster \
+  --namespace ray \
+  --set worker.initialReplicas=2 \
+  --reuse-values
+```
+GKE cluster autoscaler then provisions the second Spot node automatically.
+
+---
+
+### Incident: `torch.distributed` AllReduce blocked by NetworkPolicy
+
+**Symptom**: Training job failed with `RayActorError` in `WorkerGroup.add_workers()`. Error: connection refused between worker pods during DDP process group init.
+
+**Root cause**: PyTorch's `gloo` backend (used for CPU distributed training) requires direct peer-to-peer TCP connections between all worker processes. The `default-deny-all` NetworkPolicy in the `ray` namespace had no worker-to-worker ingress rule. The head→worker and worker→head rules existed but not worker↔worker.
+
+**Fix**: Added two rules to [k8s/app/networkpolicy.yaml](k8s/app/networkpolicy.yaml):
+
+1. New `allow-workers-from-workers` ingress policy:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-workers-from-workers
+  namespace: ray
+spec:
+  podSelector:
+    matchLabels:
+      ray.io/node-type: worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              ray.io/node-type: worker
+```
+
+2. Worker→worker egress added to `allow-worker-egress`:
+```yaml
+- to:
+    - podSelector:
+        matchLabels:
+          ray.io/node-type: worker
+```
+
+Applied with `kubectl apply -f k8s/app/networkpolicy.yaml`.
+
+---
+
+### Incident: HuggingFace SSL certificate verification failure on training workers
+
+**Symptom**: Training worker logs showed `SSLCertVerificationError: certificate verify failed: unable to get local issuer certificate` when loading `SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')`.
+
+**Root cause**: `REQUESTS_CA_BUNDLE=/etc/ssl/nessie/ca.crt` is set on all Ray pods to make pyiceberg trust Nessie's self-signed TLS cert. This env var overrides Python's `requests` library system CA bundle **globally** — including HuggingFace Hub's network checks. HuggingFace does a HEAD request to `huggingface.co` to check if a cached model is up-to-date; that request fails SSL verification because the Nessie self-signed CA doesn't cover `huggingface.co`.
+
+**Why the model pre-download didn't fully fix it**: The Dockerfile pre-downloads model weights at build time. However, `SentenceTransformer()` still does a HEAD request by default to check if the local cache is stale, even if all files are present.
+
+**Fix**: Set `HF_HUB_OFFLINE=1` to skip all network calls to HuggingFace Hub and load exclusively from the pre-baked cache:
+
+1. In `raycluster.yaml` worker env (covers normal pod starts):
+```yaml
+- name: HF_HUB_OFFLINE
+  value: "1"
+```
+
+2. Inside `train_loop_per_worker()` before the import (covers RayTrainWorker sub-processes which may not inherit pod env):
+```python
+def train_loop_per_worker(config: dict) -> None:
+    import os
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    import torch
+    from sentence_transformers import SentenceTransformer, ...
+```
+
+**Key insight**: `RayTrainWorker` processes are spawned as separate Ray actors. Pod-level env vars propagate to Ray workers in most cases, but setting it in code is defensive insurance and works regardless of how the process is launched.
+
+---
+
+### Incident: `sentence_transformers` v3 API incompatibility with raw PyTorch DataLoader
+
+**Symptom**: Training job failed with `TypeError: default_collate: batch must contain tensors, numpy arrays, numbers, dicts or lists; found <class 'sentence_transformers.readers.InputExample.InputExample'>`.
+
+**Root cause**: `sentence_transformers` v3 changed the internal training API. The code used the v2 pattern: `InputExample` objects + `CosineSimilarityLoss` + a standard PyTorch `DataLoader`. In v3, `InputExample` is still importable but is no longer designed to flow through PyTorch's `default_collate`. The old pattern worked when sentence_transformers managed the DataLoader internally (via `model.fit()`), but breaks when a raw `DataLoader` is used (as required by `ray.train.torch.TorchTrainer`).
+
+**Fix needed**: Replace `InputExample` + `CosineSimilarityLoss` with raw tensor operations compatible with PyTorch's `DataLoader`:
+- Use a custom `Dataset` that returns `(text_a, text_b, label)` tuples
+- Use a custom `collate_fn` that tokenizes text pairs into tensors
+- Replace `CosineSimilarityLoss` with `torch.nn.CosineEmbeddingLoss` (note: expects labels as `+1`/`-1`, not `1.0`/`0.0`)
+- Replace `build_training_pairs()` negative label `0.0` with `-1.0`
+
+**Status**: Not yet fixed. This is the current blocker for the training job.
+
+---
+
+### Accessing the Ray Dashboard without port-forward
+
+The cluster is private — no direct access from laptop. Two options:
+
+**Option A — `kubectl port-forward` via bastion proxy (recommended for interactive use)**:
+```bash
+# Terminal 1: SSH tunnel to bastion (keeps proxy alive)
+gcloud compute ssh ray-platform-bastion \
+  --tunnel-through-iap --project=gen-ai-pritha --zone=asia-south1-b \
+  -- -L 8888:localhost:8888
+
+# Terminal 2: port-forward through the proxy
+HTTPS_PROXY=http://localhost:8888 kubectl port-forward \
+  svc/ray-cluster-head-svc 8265:8265 -n ray
+
+# Browser: http://localhost:8265
+```
+
+**Option B — SOCKS5 proxy (accesses in-cluster IPs directly)**:
+```bash
+# SSH with SOCKS5 proxy on localhost:1080
+ssh -D 1080 -N <bastion-user>@<bastion-ip>
+
+# Configure browser to use SOCKS5 proxy at localhost:1080
+# Then navigate directly to the head pod IP: http://10.1.x.x:8265
+```
+Option A is simpler. Option B is useful when you know the pod IP and don't want to set up port-forward for every service.

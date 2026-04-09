@@ -8,6 +8,7 @@ metadata:
 spec:
   rayVersion: {{ .Chart.AppVersion | quote }}
 
+  enableInTreeAutoscaling: true
   autoscalerOptions:
     idleTimeoutSeconds: {{ .Values.worker.autoscalerOptions.idleTimeoutSeconds }}
     upscalingMode: {{ .Values.worker.autoscalerOptions.upscalingMode }}
@@ -108,6 +109,8 @@ spec:
                   value: /etc/ssl/nessie/ca.crt
                 - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
                   value: python
+                - name: HF_HUB_OFFLINE
+                  value: "1"
               volumeMounts:
                 - name: ray-spill
                   mountPath: /ray-spill

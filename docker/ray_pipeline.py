@@ -262,8 +262,10 @@ def build_training_pairs() -> list[tuple[str, str, float]]:
 
 
 def train_loop_per_worker(config: dict) -> None:
+    import os
+    os.environ["HF_HUB_OFFLINE"] = "1"
     import torch
-    from sentence_transformers import SentenceTransformer, losses, InputExample
+    from sentence_transformers import SentenceTransformer
     from torch.utils.data import DataLoader
     import ray.train
 
@@ -271,22 +273,78 @@ def train_loop_per_worker(config: dict) -> None:
     epochs = config.get("epochs", 3)
     batch_size = config.get("batch_size", 16)
 
+    # SentenceTransformer - Python library that wraps transformer models
+    # converts text → dense vector (embedding)
+    # MiniLM is a version of BERT - Google's langugae model that reads text in both directions
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    model = ray.train.torch.prepare_model(model)
+    # find_unused_parameters=True because the BERT pooler (used for [CLS]-based
+    # tasks) is part of the model but not used in mean-pooling sentence embeddings,
+    # so it never receives gradients. DDP requires this flag when any parameters
+    # are intentionally left out of the backward pass.
+    model = ray.train.torch.prepare_model(
+        model, parallel_strategy_kwargs={"find_unused_parameters": True}
+    )
 
-    train_examples = [InputExample(texts=[a, b], label=label) for a, b, label in pairs]
-    dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
-    loss_fn = losses.CosineSimilarityLoss(model)
+    # ray.train - ray's training library
+    # ray.train.torch - submodule for PyTorch
+    # returns the device this specific worker should use 
+    # (cuda:0 - first GPU, cuda:1 - second GPU, cpu, etc.)
+    # in case of time slicing - cuda:0 for worker 0, 1 etc
+    # in case of mig - cuda:0 for worker 0 - first slice, cuda:1 for worker 1 - second slice
+    device = ray.train.torch.get_device()
 
+    # torch does the actual maths, ray.train.torch coordinates multiple PyTorch workers
+    # loss rate - how wrong the model's prediction is
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    # optimiser - ensures gradient updates are synchronized across workers so all model copies update identically
     optimizer = ray.train.torch.prepare_optimizer(optimizer)
+    # measures angle between two embedding vectors. 
+    # Label 1.0 → penalizes if embeddings are far apart.
+    # Label -1.0 → penalizes if embeddings are close. 
+    # Forces similar company names to cluster together in vector space, dissimilar ones to diverge
+    loss_fn = torch.nn.CosineEmbeddingLoss()
+
+    # Keep texts as plain strings; collate into lists + label tensor.
+    # CosineEmbeddingLoss expects 1.0 (similar) or -1.0 (dissimilar).
+    # custom collate because default couldn't process str, str, float tuple
+    # collate_fn - DataLoader - processes pairs one by one then combine them into a batch
+    def collate_fn(batch):
+        texts_a = [item[0] for item in batch]
+        texts_b = [item[1] for item in batch]
+        # torch tensor converts python list to pytorch tensor - arrary that can be read by GPU
+        labels = torch.tensor(
+            [1.0 if item[2] > 0.5 else -1.0 for item in batch],
+            dtype=torch.float32,
+        )
+        return texts_a, texts_b, labels
+
+    dataloader = DataLoader(pairs, shuffle=True, batch_size=batch_size, collate_fn=collate_fn)
+
+    # Unwrap DDP to reach SentenceTransformer's tokenizer and forward.
+    inner_model = model.module if hasattr(model, "module") else model
+    tokenizer = inner_model.tokenizer
 
     for epoch in range(epochs):
         total_loss = 0.0
-        for batch in dataloader:
-            features, labels = batch
-            loss_value = loss_fn(features, labels)
+        model.train()
+        for texts_a, texts_b, labels in dataloader:
+            labels = labels.to(device)
+            n = len(texts_a)
+            # Encode both sets in ONE forward pass to avoid a shared internal
+            # buffer (position_ids) being modified in-place between two separate
+            # forward calls, which would corrupt the autograd graph.
+            features = tokenizer(
+                texts_a + texts_b,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
+            )
+            features = {k: v.to(device) for k, v in features.items()}
+            all_emb = model(features)["sentence_embedding"]
+            emb_a, emb_b = all_emb[:n], all_emb[n:]
             optimizer.zero_grad()
+            loss_value = loss_fn(emb_a, emb_b, labels)
             loss_value.backward()
             optimizer.step()
             total_loss += loss_value.item()
@@ -295,11 +353,40 @@ def train_loop_per_worker(config: dict) -> None:
         ray.train.report({"epoch": epoch + 1, "loss": avg_loss})
         print(f"Epoch {epoch + 1}/{epochs} — loss: {avg_loss:.4f}")
 
+    # ray.train.get_context().get_world_rank() - returns the worker rank - worker 0 is 0
+    # ensures only one worker (here 0) saves the model
     if ray.train.get_context().get_world_rank() == 0 and MODEL_OUTPUT_PATH:
-        model.save(MODEL_OUTPUT_PATH)
+        import tempfile
+        save_model = model.module if hasattr(model, "module") else model
+        if MODEL_OUTPUT_PATH.startswith("gs://"):
+            # SentenceTransformer.save() is local-only; save to a temp dir
+            # then upload each file to GCS.
+            # REQUESTS_CA_BUNDLE is set cluster-wide to the Nessie self-signed
+            # CA, which breaks TLS to storage.googleapis.com. Unset it for the
+            # upload so the system CA bundle is used instead.
+            from google.cloud import storage as gcs_storage
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                save_model.save(tmp_dir)
+                gcs_path = MODEL_OUTPUT_PATH[5:]  # strip "gs://"
+                bucket_name, blob_prefix = gcs_path.split("/", 1)
+                nessie_ca = os.environ.pop("REQUESTS_CA_BUNDLE", None)
+                try:
+                    client = gcs_storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    for root, _, files in os.walk(tmp_dir):
+                        for fname in files:
+                            local = os.path.join(root, fname)
+                            rel = os.path.relpath(local, tmp_dir)
+                            blob = bucket.blob(f"{blob_prefix}/{rel}")
+                            blob.upload_from_filename(local)
+                finally:
+                    if nessie_ca:
+                        os.environ["REQUESTS_CA_BUNDLE"] = nessie_ca
+        else:
+            save_model.save(MODEL_OUTPUT_PATH)
         print(f"Model saved to {MODEL_OUTPUT_PATH}")
 
-
+# LLM generates the labeled data, model learns from it
 def run_training() -> None:
     from ray.train import ScalingConfig
     from ray.train.torch import TorchTrainer
@@ -317,11 +404,16 @@ def run_training() -> None:
         },
         scaling_config=ScalingConfig(
             num_workers=NUM_WORKERS,
-            use_gpu=True,
-            resources_per_worker={"GPU": 1, "train_worker": 1},
+            use_gpu=False,
+            resources_per_worker={"worker_pool": 1},
         ),
     )
-
+    
+    # Kicks off the distributed training job. 
+    # Ray spawns train_loop_per_worker on each worker pod, 
+    # passes train_loop_config, and runs all epochs. 
+    # Blocks until all workers finish. 
+    # Returns metrics (loss etc.) reported via ray.train.report()
     result = trainer.fit()
     print(f"Training complete. Final metrics: {result.metrics}")
 
